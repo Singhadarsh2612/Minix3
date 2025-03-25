@@ -1,4 +1,4 @@
-c#include "fat32.h"
+#include "fat32.h"
 #include <minix/fsdriver.h>
 #include <stdio.h>
 #include <stdlib.h>

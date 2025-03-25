@@ -8,6 +8,7 @@ SUBDIR+=	ext2
 SUBDIR+=	isofs
 SUBDIR+=	procfs
 SUBDIR+=	ptyfs
+SUBDIR+=	fat32  # Added FAT32 support
 
 .  if ${MACHINE_ARCH} == "i386"
 SUBDIR+=	hgfs

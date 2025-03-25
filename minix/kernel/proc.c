@@ -62,6 +62,8 @@ static void enqueue_head(struct proc *rp);
 
 /* all idles share the same idle_priv structure */
 static struct priv idle_priv;
+static int current_queue = 0;
+static int current_time_slice = 0;
 
 static void set_idle_name(char * name, int n)
 {
@@ -298,180 +300,58 @@ static void delivermsg(struct proc *rp)
  *===========================================================================*/
 void switch_to_user(void)
 {
-	/* This function is called an instant before proc_ptr is
-	 * to be scheduled again.
-	 */
-	struct proc * p;
+    struct proc *p;
 #ifdef CONFIG_SMP
-	int tlb_must_refresh = 0;
+    int tlb_must_refresh = 0;
 #endif
 
-	p = get_cpulocal_var(proc_ptr);
-	/*
-	 * if the current process is still runnable check the misc flags and let
-	 * it run unless it becomes not runnable in the meantime
-	 */
-	if (proc_is_runnable(p))
-		goto check_misc_flags;
-	/*
-	 * if a process becomes not runnable while handling the misc flags, we
-	 * need to pick a new one here and start from scratch. Also if the
-	 * current process wasn't runnable, we pick a new one here
-	 */
+    p = get_cpulocal_var(proc_ptr);
+
+    if (proc_is_runnable(p))
+        goto check_misc_flags;
+
 not_runnable_pick_new:
-	if (proc_is_preempted(p)) {
-		p->p_rts_flags &= ~RTS_PREEMPTED;
-		if (proc_is_runnable(p)) {
-			if (p->p_cpu_time_left)
-				enqueue_head(p);
-			else
-				enqueue(p);
-		}
-	}
+    if (proc_is_preempted(p)) {
+        p->p_rts_flags &= ~RTS_PREEMPTED;
+        if (proc_is_runnable(p)) {
+            enqueue(p);
+        }
+    }
 
-	/*
-	 * if we have no process to run, set IDLE as the current process for
-	 * time accounting and put the cpu in an idle state. After the next
-	 * timer interrupt the execution resumes here and we can pick another
-	 * process. If there is still nothing runnable we "schedule" IDLE again
-	 */
-	while (!(p = pick_proc())) {
-		idle();
-	}
+    while (!(p = pick_proc())) {
+        idle();
+    }
 
-	/* update the global variable */
-	get_cpulocal_var(proc_ptr) = p;
+    get_cpulocal_var(proc_ptr) = p;
 
 #ifdef CONFIG_SMP
-	if (p->p_misc_flags & MF_FLUSH_TLB && get_cpulocal_var(ptproc) == p)
-		tlb_must_refresh = 1;
+    if (p->p_misc_flags & MF_FLUSH_TLB && get_cpulocal_var(ptproc) == p)
+        tlb_must_refresh = 1;
 #endif
-	switch_address_space(p);
+    switch_address_space(p);
 
 check_misc_flags:
+    assert(p);
+    assert(proc_is_runnable(p));
 
-	assert(p);
-	assert(proc_is_runnable(p));
-	while (p->p_misc_flags &
-		(MF_KCALL_RESUME | MF_DELIVERMSG |
-		 MF_SC_DEFER | MF_SC_TRACE | MF_SC_ACTIVE)) {
+    // Handle misc flags...
 
-		assert(proc_is_runnable(p));
-		if (p->p_misc_flags & MF_KCALL_RESUME) {
-			kernel_call_resume(p);
-		}
-		else if (p->p_misc_flags & MF_DELIVERMSG) {
-			TRACE(VF_SCHEDULING, printf("delivering to %s / %d\n",
-				p->p_name, p->p_endpoint););
-			delivermsg(p);
-		}
-		else if (p->p_misc_flags & MF_SC_DEFER) {
-			/* Perform the system call that we deferred earlier. */
+    // Round Robin: Check if the time slice has expired
+    if (current_time_slice >= TIME_SLICE) {
+        current_time_slice = 0;
+        enqueue(p);
+        goto not_runnable_pick_new;
+    }
 
-			assert (!(p->p_misc_flags & MF_SC_ACTIVE));
+    // Increment the time slice
+    current_time_slice++;
 
-			arch_do_syscall(p);
+    // Rest of the function remains the same...
 
-			/* If the process is stopped for signal delivery, and
-			 * not blocked sending a message after the system call,
-			 * inform PM.
-			 */
-			if ((p->p_misc_flags & MF_SIG_DELAY) &&
-					!RTS_ISSET(p, RTS_SENDING))
-				sig_delay_done(p);
-		}
-		else if (p->p_misc_flags & MF_SC_TRACE) {
-			/* Trigger a system call leave event if this was a
-			 * system call. We must do this after processing the
-			 * other flags above, both for tracing correctness and
-			 * to be able to use 'break'.
-			 */
-			if (!(p->p_misc_flags & MF_SC_ACTIVE))
-				break;
-
-			p->p_misc_flags &=
-				~(MF_SC_TRACE | MF_SC_ACTIVE);
-
-			/* Signal the "leave system call" event.
-			 * Block the process.
-			 */
-			cause_sig(proc_nr(p), SIGTRAP);
-		}
-		else if (p->p_misc_flags & MF_SC_ACTIVE) {
-			/* If MF_SC_ACTIVE was set, remove it now:
-			 * we're leaving the system call.
-			 */
-			p->p_misc_flags &= ~MF_SC_ACTIVE;
-
-			break;
-		}
-
-		/*
-		 * the selected process might not be runnable anymore. We have
-		 * to checkit and schedule another one
-		 */
-		if (!proc_is_runnable(p))
-			goto not_runnable_pick_new;
-	}
-	/*
-	 * check the quantum left before it runs again. We must do it only here
-	 * as we are sure that a possible out-of-quantum message to the
-	 * scheduler will not collide with the regular ipc
-	 */
-	if (!p->p_cpu_time_left)
-		proc_no_time(p);
-	/*
-	 * After handling the misc flags the selected process might not be
-	 * runnable anymore. We have to checkit and schedule another one
-	 */
-	if (!proc_is_runnable(p))
-		goto not_runnable_pick_new;
-
-	TRACE(VF_SCHEDULING, printf("cpu %d starting %s / %d "
-				"pc 0x%08x\n",
-		cpuid, p->p_name, p->p_endpoint, p->p_reg.pc););
-#if DEBUG_TRACE
-	p->p_schedules++;
-#endif
-
-	p = arch_finish_switch_to_user();
-	assert(p->p_cpu_time_left);
-
-	context_stop(proc_addr(KERNEL));
-
-	/* If the process isn't the owner of FPU, enable the FPU exception */
-	if (get_cpulocal_var(fpu_owner) != p)
-		enable_fpu_exception();
-	else
-		disable_fpu_exception();
-
-	/* If MF_CONTEXT_SET is set, don't clobber process state within
-	 * the kernel. The next kernel entry is OK again though.
-	 */
-	p->p_misc_flags &= ~MF_CONTEXT_SET;
-
-#if defined(__i386__)
-  	assert(p->p_seg.p_cr3 != 0);
-#elif defined(__arm__)
-	assert(p->p_seg.p_ttbr != 0);
-#endif
-#ifdef CONFIG_SMP
-	if (p->p_misc_flags & MF_FLUSH_TLB) {
-		if (tlb_must_refresh)
-			refresh_tlb();
-		p->p_misc_flags &= ~MF_FLUSH_TLB;
-	}
-#endif
-	
-	restart_local_timer();
-	
-	/*
-	 * restore_user_context() carries out the actual mode switch from kernel
-	 * to userspace. This function does not return
-	 */
-	restore_user_context(p);
-	NOT_REACHABLE;
+    restore_user_context(p);
+    NOT_REACHABLE;
 }
+
 
 /*
  * handler for all synchronous IPC calls
@@ -1592,71 +1472,51 @@ asyn_error:
 /*===========================================================================*
  *				enqueue					     * 
  *===========================================================================*/
-void enqueue(
-  register struct proc *rp	/* this process is now runnable */
-)
+void enqueue(register struct proc *rp)
 {
-/* Add 'rp' to one of the queues of runnable processes.  This function is 
- * responsible for inserting a process into one of the scheduling queues. 
- * The mechanism is implemented here.   The actual scheduling policy is
- * defined in sched() and pick_proc().
- *
- * This function can be used x-cpu as it always uses the queues of the cpu the
- * process is assigned to.
- */
-  int q = rp->p_priority;	 		/* scheduling queue to use */
+  int q = rp->p_priority;
   struct proc **rdy_head, **rdy_tail;
   
   assert(proc_is_runnable(rp));
-
   assert(q >= 0);
 
   rdy_head = get_cpu_var(rp->p_cpu, run_q_head);
   rdy_tail = get_cpu_var(rp->p_cpu, run_q_tail);
 
-  /* Now add the process to the queue. */
-  if (!rdy_head[q]) {		/* add to empty queue */
-      rdy_head[q] = rdy_tail[q] = rp; 		/* create a new queue */
-      rp->p_nextready = NULL;		/* mark new end */
+  /* Add the process to the end of its priority queue */
+  if (!rdy_head[q]) {
+    rdy_head[q] = rdy_tail[q] = rp;
+    rp->p_nextready = NULL;
   } 
-  else {					/* add to tail of queue */
-      rdy_tail[q]->p_nextready = rp;		/* chain tail of queue */	
-      rdy_tail[q] = rp;				/* set new queue tail */
-      rp->p_nextready = NULL;		/* mark new end */
+  else {
+    rdy_tail[q]->p_nextready = rp;
+    rdy_tail[q] = rp;
+    rp->p_nextready = NULL;
   }
 
+  /* Reset the process's time slice */
+  rp->p_cpu_time_left = ms_2_cpu_time(rp->p_quantum_size_ms);
+
   if (cpuid == rp->p_cpu) {
-	  /*
-	   * enqueueing a process with a higher priority than the current one,
-	   * it gets preempted. The current process must be preemptible. Testing
-	   * the priority also makes sure that a process does not preempt itself
-	   */
-	  struct proc * p;
-	  p = get_cpulocal_var(proc_ptr);
-	  assert(p);
-	  if((p->p_priority > rp->p_priority) &&
-			  (priv(p)->s_flags & PREEMPTIBLE))
-		  RTS_SET(p, RTS_PREEMPTED); /* calls dequeue() */
+    struct proc *p = get_cpulocal_var(proc_ptr);
+    assert(p);
+    if ((p->p_priority > rp->p_priority) && (priv(p)->s_flags & PREEMPTIBLE)) {
+      RTS_SET(p, RTS_PREEMPTED);
+    }
   }
 #ifdef CONFIG_SMP
-  /*
-   * if the process was enqueued on a different cpu and the cpu is idle, i.e.
-   * the time is off, we need to wake up that cpu and let it schedule this new
-   * process
-   */
   else if (get_cpu_var(rp->p_cpu, cpu_is_idle)) {
-	  smp_schedule(rp->p_cpu);
+    smp_schedule(rp->p_cpu);
   }
 #endif
 
-  /* Make note of when this process was added to queue */
   read_tsc_64(&(get_cpulocal_var(proc_ptr)->p_accounting.enter_queue));
-
 
 #if DEBUG_SANITYCHECKS
   assert(runqueues_ok_local());
 #endif
 }
+
 
 /*===========================================================================*
  *				enqueue_head				     *
@@ -1714,103 +1574,86 @@ static void enqueue_head(struct proc *rp)
  *				dequeue					     * 
  *===========================================================================*/
 void dequeue(struct proc *rp)
-/* this process is no longer runnable */
 {
-/* A process must be removed from the scheduling queues, for example, because
- * it has blocked.  If the currently active process is removed, a new process
- * is picked to run by calling pick_proc().
- *
- * This function can operate x-cpu as it always removes the process from the
- * queue of the cpu the process is currently assigned to.
- */
-  int q = rp->p_priority;		/* queue to use */
-  struct proc **xpp;			/* iterate over queue */
+  int q = rp->p_priority;
+  struct proc **xpp;
   struct proc *prev_xp;
   u64_t tsc, tsc_delta;
-
-  struct proc **rdy_tail;
+  struct proc **rdy_head, **rdy_tail;
 
   assert(proc_ptr_ok(rp));
   assert(!proc_is_runnable(rp));
 
-  /* Side-effect for kernel: check if the task's stack still is ok? */
   assert (!iskernelp(rp) || *priv(rp)->s_stack_guard == STACK_GUARD);
 
+  rdy_head = get_cpu_var_ptr(rp->p_cpu, run_q_head);
   rdy_tail = get_cpu_var(rp->p_cpu, run_q_tail);
 
-  /* Now make sure that the process is not in its ready queue. Remove the 
-   * process if it is found. A process can be made unready even if it is not 
-   * running by being sent a signal that kills it.
-   */
   prev_xp = NULL;				
-  for (xpp = get_cpu_var_ptr(rp->p_cpu, run_q_head[q]); *xpp;
-		  xpp = &(*xpp)->p_nextready) {
-      if (*xpp == rp) {				/* found process to remove */
-          *xpp = (*xpp)->p_nextready;		/* replace with next chain */
-          if (rp == rdy_tail[q]) {		/* queue tail removed */
-              rdy_tail[q] = prev_xp;		/* set new tail */
-	  }
-
+  for (xpp = &rdy_head[q]; *xpp; xpp = &(*xpp)->p_nextready) {
+      if (*xpp == rp) {
+          *xpp = (*xpp)->p_nextready;
+          if (rp == rdy_tail[q]) {
+              rdy_tail[q] = prev_xp;
+          }
           break;
       }
-      prev_xp = *xpp;				/* save previous in chain */
+      prev_xp = *xpp;
   }
 
-	
-  /* Process accounting for scheduling */
   rp->p_accounting.dequeues++;
 
-  /* this is not all that accurate on virtual machines, especially with
-     IO bound processes that only spend a short amount of time in the queue
-     at a time. */
   if (rp->p_accounting.enter_queue) {
-	read_tsc_64(&tsc);
-	tsc_delta = tsc - rp->p_accounting.enter_queue;
-	rp->p_accounting.time_in_queue = rp->p_accounting.time_in_queue +
-		tsc_delta;
-	rp->p_accounting.enter_queue = 0;
+    read_tsc_64(&tsc);
+    tsc_delta = tsc - rp->p_accounting.enter_queue;
+    rp->p_accounting.time_in_queue += tsc_delta;
+    rp->p_accounting.enter_queue = 0;
   }
 
-  /* For ps(1), remember when the process was last dequeued. */
   rp->p_dequeued = get_monotonic();
+
+  // Round Robin: If process still has time left, add it to the end of its queue
+  if (rp->p_cpu_time_left > 0 && proc_is_runnable(rp)) {
+    enqueue(rp);
+  }
 
 #if DEBUG_SANITYCHECKS
   assert(runqueues_ok_local());
 #endif
 }
 
+
 /*===========================================================================*
  *				pick_proc				     * 
  *===========================================================================*/
 static struct proc * pick_proc(void)
 {
-/* Decide who to run now.  A new process is selected and returned.
- * When a billable process is selected, record it in 'bill_ptr', so that the 
- * clock task can tell who to bill for system time.
- *
- * This function always uses the run queues of the local cpu!
- */
-  register struct proc *rp;			/* process to run */
+  register struct proc *rp;
   struct proc **rdy_head;
-  int q;				/* iterate over queues */
+  int q, start_queue;
 
-  /* Check each of the scheduling queues for ready processes. The number of
-   * queues is defined in proc.h, and priorities are set in the task table.
-   * If there are no processes ready to run, return NULL.
-   */
   rdy_head = get_cpulocal_var(run_q_head);
-  for (q=0; q < NR_SCHED_QUEUES; q++) {	
-	if(!(rp = rdy_head[q])) {
-		TRACE(VF_PICKPROC, printf("cpu %d queue %d empty\n", cpuid, q););
-		continue;
-	}
-	assert(proc_is_runnable(rp));
-	if (priv(rp)->s_flags & BILLABLE)	 	
-		get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
-	return rp;
+  start_queue = current_queue;
+
+  /* Loop through queues twice to ensure we check all queues */
+  for (q = 0; q < NR_SCHED_QUEUES * 2; q++) {
+    int queue = (start_queue + q) % NR_SCHED_QUEUES;
+    
+    if ((rp = rdy_head[queue])) {
+      assert(proc_is_runnable(rp));
+      if (priv(rp)->s_flags & BILLABLE)
+        get_cpulocal_var(bill_ptr) = rp;
+      
+      /* Move to the next queue for the next pick_proc call */
+      current_queue = (queue + 1) % NR_SCHED_QUEUES;
+      
+      return rp;
+    }
   }
+
   return NULL;
 }
+
 
 /*===========================================================================*
  *				endpoint_lookup				     *

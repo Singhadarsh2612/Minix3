@@ -103,9 +103,11 @@
 #   do-obsolete:     installs the obsolete sets (for the postinstall-* targets).
 #
 
-.if ${.MAKEFLAGS:M${.CURDIR}/share/mk} == ""
-.MAKEFLAGS: -m ${.CURDIR}/share/mk
+.if empty(.MAKEFLAGS:M${.CURDIR}/share/mk)
+	.MAKEFLAGS += -m ${.CURDIR}/share/mk  # ✅ Use += instead of :
 .endif
+
+
 
 #
 # If _SRC_TOP_OBJ_ gets set here, we will end up with a directory that may
